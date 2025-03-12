@@ -2,6 +2,7 @@
 """
 Impact Gap Calculator for Gerrymandering Analysis
 Author: Christopher McAllester
+Initial Version: 2019
 Updated: 2024
 
 This script calculates the impact gap gerrymandering metric by analyzing voter distributions
@@ -13,6 +14,17 @@ Key Features:
 - Computes entropy-based metrics for district analysis
 - Supports multi-party analysis (optimized for two-party systems)
 - Handles CSV input for voter data
+
+Current Concerns:
+  1) may be numerically unstable at large voter sizes
+  2) calculation time may not scale well to large electorate sizes,
+  and many distance calculations may be repeated if
+  voter data is only accurate to the polling location
+  3) does not deal with the corrections necessary to account for
+  the effects of the non-Euclidean curvature of the Earth on distances
+  - these are likely mild effects
+  4) a Gaussian kernel is intuitively correct, but (more difficult)
+  direct modeling of average district maps may be worthwhile
 
 Usage:
     python impact_gap.py --v voter_data.csv [--h header_lines] [--out output_dir]
