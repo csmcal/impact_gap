@@ -13,7 +13,7 @@ Key Features:
 - Calculates pairwise voter distances and density estimations
 - Computes entropy-based metrics for district analysis
 - Supports multi-party analysis (optimized for two-party systems)
-- Supports analysis of any categorical demographic variable (party, race, education, etc.)
+- Supports analysis of any categorical demographic variable (party, race, education, income, etc.)
 - Handles HDF5 input for voter data with demographic information
 
 Current Concerns:
@@ -65,6 +65,19 @@ DEMOGRAPHIC_VARIABLES = {
         'description': 'Education level',
         'name_getter': lambda _: {e.value: e.name for e in Education},
         'num_categories': lambda _: len(Education)
+    },
+    'income_decile': {
+        'description': 'Income decile (1-10)',
+        'name_getter': lambda _: {i: f"Income Decile {i+1}" for i in range(10)},
+        'num_categories': lambda _: 10
+    },
+    'household_size': {
+        'description': 'Number of people in household',
+        # Assuming max household size of 8, with 8+ grouped together
+        'name_getter': lambda _: {
+            i: str(i+1) if i < 7 else "8+" for i in range(8)
+        },
+        'num_categories': lambda _: 8  # 1-7 and 8+
     }
 }
 
@@ -244,7 +257,8 @@ def calculate_impact_gap(
         demographic_var: Name of demographic variable to analyze
     
     Returns:
-        Dictionary containing impact gap results and intermediate calculations
+        Dictionary containing impact gap results and intermediate calculations,
+        including all pairwise impact gaps between categories
     """
     try:
         if demographic_var not in DEMOGRAPHIC_VARIABLES:
@@ -270,6 +284,24 @@ def calculate_impact_gap(
         # Get category names
         category_names = DEMOGRAPHIC_VARIABLES[demographic_var]['name_getter'](voter_data)
         
+        # Calculate all pairwise impact gaps
+        num_categories = DEMOGRAPHIC_VARIABLES[demographic_var]['num_categories'](voter_data)
+        pairwise_gaps = []
+        for i in range(num_categories):
+            for j in range(i + 1, num_categories):
+                gap = abs(avg_I_c[i] - avg_I_c[j])
+                cat1, cat2 = category_names[i], category_names[j]
+                pairwise_gaps.append({
+                    'category1': cat1,
+                    'category2': cat2,
+                    'gap': gap,
+                    'avg_impact1': avg_I_c[i],
+                    'avg_impact2': avg_I_c[j]
+                })
+        
+        # Sort gaps by magnitude
+        pairwise_gaps.sort(key=lambda x: x['gap'], reverse=True)
+        
         # Calculate overall impact gap (difference between max and min impacts)
         impact_gap = np.max(avg_I_c) - np.min(avg_I_c)
         max_impact_category = category_names[np.argmax(avg_I_c)]
@@ -277,7 +309,7 @@ def calculate_impact_gap(
             
         return {
             'demographic_var': demographic_var,
-            'impact_gap': impact_gap,
+            'impact_gap': impact_gap,  # Maximum gap (for backward compatibility)
             'category_impacts': I_c,
             'avg_category_impacts': avg_I_c,
             'category_counts': category_counts,
@@ -285,7 +317,8 @@ def calculate_impact_gap(
             'district_entropies': H_dist,
             'max_impact_category': max_impact_category,
             'min_impact_category': min_impact_category,
-            'category_names': category_names
+            'category_names': category_names,
+            'pairwise_gaps': pairwise_gaps
         }
         
     except Exception as e:
@@ -312,11 +345,20 @@ def main(args: argparse.Namespace) -> None:
         
         # Log results
         logging.info(f"\nImpact Gap Analysis for {results['demographic_var']}:")
-        logging.info(f"Overall Impact Gap: {results['impact_gap']:.4f}")
+        logging.info(f"Maximum Impact Gap: {results['impact_gap']:.4f}")
         logging.info(f"Most Impacted: {results['max_impact_category']}")
         logging.info(f"Least Impacted: {results['min_impact_category']}")
-        logging.info("\nDetailed Category Impacts:")
         
+        # Log all pairwise gaps
+        logging.info("\nPairwise Impact Gaps (sorted by magnitude):")
+        for gap_info in results['pairwise_gaps']:
+            logging.info(
+                f"{gap_info['category1']} vs {gap_info['category2']}: "
+                f"Gap = {gap_info['gap']:.4f} "
+                f"(Impacts: {gap_info['avg_impact1']:.4f} vs {gap_info['avg_impact2']:.4f})"
+            )
+        
+        logging.info("\nDetailed Category Statistics:")
         for category, (impact, avg_impact) in enumerate(zip(
             results['category_impacts'],
             results['avg_category_impacts']

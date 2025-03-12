@@ -1,0 +1,43 @@
+{
+    "demographics": {
+        "race_minority": {
+            "base_probability": 0.3,
+            "hotspots": [
+                {
+                    "center": [42.3601, -71.0589],
+                    "strength": 0.4,
+                    "spread": [[0.01, 0], [0, 0.01]]
+                },
+                {
+                    "center": [42.3317, -71.1211],
+                    "strength": 0.3,
+                    "spread": [[0.008, 0], [0, 0.008]]
+                }
+            ]
+        },
+        "income_below_median": {
+            "base_probability": 0.5,
+            "hotspots": [
+                {
+                    "center": [42.3875, -71.0995],
+                    "strength": 0.35,
+                    "spread": [[0.012, 0.003], [0.003, 0.012]]
+                }
+            ]
+        }
+    },
+    "party": {
+        "base_probability": 0.45,
+        "hotspots": [
+            {
+                "center": [42.3601, -71.0589],
+                "strength": 0.3,
+                "spread": [[0.015, 0], [0, 0.015]]
+            }
+        ],
+        "demographic_weights": {
+            "race_minority": 0.2,
+            "income_below_median": 0.15
+        }
+    }
+} 
