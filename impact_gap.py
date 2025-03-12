@@ -13,7 +13,8 @@ Key Features:
 - Calculates pairwise voter distances and density estimations
 - Computes entropy-based metrics for district analysis
 - Supports multi-party analysis (optimized for two-party systems)
-- Handles CSV input for voter data
+- Supports analysis of any categorical demographic variable (party, race, education, etc.)
+- Handles HDF5 input for voter data with demographic information
 
 Current Concerns:
 1) may be numerically unstable at large voter sizes
@@ -27,20 +28,20 @@ the effects of the non-Euclidean curvature of the Earth on distances
 direct modeling of average district maps may be worthwhile
 
 Usage:
-    python impact_gap.py --v voter_data.csv [--h header_lines] [--out output_dir]
+    python impact_gap.py --input voter_data.h5 [--demographic party_id] [--out output_dir]
 """
 
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 import numpy as np
 import numpy.typing as npt
 import argparse
 import math
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from scipy.spatial.distance import pdist, squareform
 from scipy.optimize import fsolve
 import logging
+from voter_data_schema import VoterData, VoterMetadata, Race, Education
 
 # Configure logging
 logging.basicConfig(
@@ -48,42 +49,24 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-@dataclass
-class VoterData:
-    """Container for voter-related data and calculations."""
-    coords: npt.NDArray
-    party: npt.NDArray
-    district: npt.NDArray
-    num_voters: int
-    num_parties: int
-    num_districts: int
-    ideal_district_size: float
-
-    @classmethod
-    def from_array(cls, voters: npt.NDArray) -> 'VoterData':
-        """Create VoterData from a structured numpy array."""
-        num_voters = voters.shape[0]
-        num_parties = np.amax(voters['party']) + 1
-        num_districts = np.amax(voters['district']) + 1
-        
-        return cls(
-            coords=np.vstack((voters['x1'], voters['x2'])).T,
-            party=voters['party'],
-            district=voters['district'],
-            num_voters=num_voters,
-            num_parties=num_parties,
-            num_districts=num_districts,
-            ideal_district_size=num_voters / num_districts
-        )
-
-    def validate(self) -> None:
-        """Validate the voter data for basic requirements."""
-        if self.num_voters <= 10:
-            raise ValueError(f'Too few voters: {self.num_voters} (minimum 10 required)')
-        if self.num_parties <= 1:
-            raise ValueError('At least two parties required for impact analysis')
-        if self.num_districts <= 1:
-            raise ValueError('At least two districts required for gerrymandering analysis')
+# Define available demographic variables and their metadata
+DEMOGRAPHIC_VARIABLES = {
+    'party_id': {
+        'description': 'Political party affiliation',
+        'name_getter': lambda vd: vd.metadata.party_names,
+        'num_categories': lambda vd: vd.metadata.num_parties
+    },
+    'race': {
+        'description': 'Racial category',
+        'name_getter': lambda _: {r.value: r.name for r in Race},
+        'num_categories': lambda _: len(Race)
+    },
+    'education': {
+        'description': 'Education level',
+        'name_getter': lambda _: {e.value: e.name for e in Education},
+        'num_categories': lambda _: len(Education)
+    }
+}
 
 def biv_gauss(d: npt.NDArray, h: float) -> npt.NDArray:
     """
@@ -132,16 +115,19 @@ def estimate_density(voter_data: VoterData) -> npt.NDArray:
         Array of normalized density estimates
     """
     try:
-        pairwise_dists = pdist(voter_data.coords, metric='euclidean')
+        # Extract coordinates into a 2D array for distance calculation
+        coords = np.column_stack((voter_data.data['longitude'], voter_data.data['latitude']))
+        
+        pairwise_dists = pdist(coords, metric='euclidean')
         dist_matrix = squareform(pairwise_dists)
         
         # Use maximum distance as initial bandwidth
         pilot_h = np.max(pairwise_dists)
         
-        h = estimate_scaling(dist_matrix, pilot_h, voter_data.ideal_district_size)
+        h = estimate_scaling(dist_matrix, pilot_h, voter_data.metadata.num_voters / voter_data.metadata.num_districts)
         K_scaled = biv_gauss(dist_matrix, h)
         
-        return K_scaled / voter_data.ideal_district_size
+        return K_scaled / (voter_data.metadata.num_voters / voter_data.metadata.num_districts)
     
     except Exception as e:
         logging.error(f"Error in density estimation: {str(e)}")
@@ -165,153 +151,146 @@ def entropy(prob_array: npt.NDArray, base: float = math.e) -> npt.NDArray:
 
 def individual_entropies(
     K_scaled: npt.NDArray,
-    voter_data: VoterData
+    voter_data: VoterData,
+    demographic_var: str
 ) -> npt.NDArray:
     """
-    Calculate entropy of 'average district' at each voter location.
+    Calculate entropy of 'average district' at each voter location for a given demographic variable.
     
     Args:
         K_scaled: Scaled kernel density matrix
         voter_data: VoterData instance containing voter information
+        demographic_var: Name of demographic variable to analyze
     
     Returns:
         Array of entropy values for each voter location
     """
-    party_probs = np.zeros((voter_data.num_parties, voter_data.num_voters))
+    num_categories = DEMOGRAPHIC_VARIABLES[demographic_var]['num_categories'](voter_data)
+    category_probs = np.zeros((num_categories, voter_data.metadata.num_voters))
     
-    # Vectorized operation for party density summation
-    for party in range(voter_data.num_parties):
-        mask = voter_data.party == party
-        party_probs[party] = np.sum(K_scaled[mask], axis=0)
+    # Vectorized operation for category density summation
+    for category in range(num_categories):
+        mask = voter_data.data[demographic_var] == category
+        category_probs[category] = np.sum(K_scaled[mask], axis=0)
     
-    return entropy(party_probs)
+    return entropy(category_probs)
 
-def district_entropies(voter_data: VoterData) -> npt.NDArray:
+def district_entropies(
+    voter_data: VoterData,
+    demographic_var: str
+) -> npt.NDArray:
     """
-    Calculate entropy of the electorate in each planned or established district.
+    Calculate entropy of the electorate in each district for a given demographic variable.
     
     Args:
         voter_data: VoterData instance containing voter information
+        demographic_var: Name of demographic variable to analyze
     
     Returns:
         Array of entropy values for each district
     """
-    # Calculate party counts per district using numpy operations
-    counts = np.zeros((voter_data.num_parties, voter_data.num_districts))
-    for party in range(voter_data.num_parties):
-        for district in range(voter_data.num_districts):
-            counts[party, district] = np.sum(
-                (voter_data.party == party) & (voter_data.district == district)
+    # Calculate demographic category counts per district using numpy operations
+    num_categories = DEMOGRAPHIC_VARIABLES[demographic_var]['num_categories'](voter_data)
+    counts = np.zeros((num_categories, voter_data.metadata.num_districts))
+    
+    for category in range(num_categories):
+        for district in range(voter_data.metadata.num_districts):
+            counts[category, district] = np.sum(
+                (voter_data.data[demographic_var] == category) & 
+                (voter_data.data['district_id'] == district)
             )
     
     # Calculate frequencies and entropy
     freqs = counts / np.sum(counts, axis=0)
     return entropy(freqs)
 
-def party_impacts(
+def category_impacts(
     H_i: npt.NDArray,
     H_d: npt.NDArray,
-    voter_data: VoterData
+    voter_data: VoterData,
+    demographic_var: str
 ) -> npt.NDArray:
     """
-    Calculate impact of districting plan on each party.
+    Calculate impact of districting plan on each category of a demographic variable.
     
     Args:
         H_i: Individual entropy values
         H_d: District entropy values
         voter_data: VoterData instance
+        demographic_var: Name of demographic variable to analyze
     
     Returns:
-        Array of impact values for each party
+        Array of impact values for each category
     """
-    I_p = np.zeros(voter_data.num_parties)
-    for party in range(voter_data.num_parties):
-        party_mask = voter_data.party == party
-        I_p[party] = np.sum(
-            H_d[voter_data.district[party_mask]] - H_i[party_mask]
+    num_categories = DEMOGRAPHIC_VARIABLES[demographic_var]['num_categories'](voter_data)
+    I_c = np.zeros(num_categories)
+    
+    for category in range(num_categories):
+        category_mask = voter_data.data[demographic_var] == category
+        I_c[category] = np.sum(
+            H_d[voter_data.data['district_id'][category_mask]] - H_i[category_mask]
         )
-    return I_p
+    return I_c
 
-def calculate_impact_gap(voter_data: VoterData) -> Dict[str, Any]:
+def calculate_impact_gap(
+    voter_data: VoterData,
+    demographic_var: str = 'party_id'
+) -> Dict[str, Any]:
     """
-    Calculate the impact gap metric for a given voter distribution.
+    Calculate the impact gap metric for a given voter distribution and demographic variable.
     
     Args:
         voter_data: VoterData instance containing voter information
+        demographic_var: Name of demographic variable to analyze
     
     Returns:
         Dictionary containing impact gap results and intermediate calculations
     """
     try:
-        # Validate input data
-        voter_data.validate()
+        if demographic_var not in DEMOGRAPHIC_VARIABLES:
+            raise ValueError(f"Unsupported demographic variable: {demographic_var}")
         
         # Calculate kernel densities for each voter location
         K_scaled = estimate_density(voter_data)
         
-        # Calculate the entropy of the average district 
-        # (the 'idealized electorate') at each voter location
-        H_indi = individual_entropies(K_scaled, voter_data)
+        # Calculate the entropy of the 'idealized electorate' or 
+        # average district at each voter location
+        H_indi = individual_entropies(K_scaled, voter_data, demographic_var)
 
         # Calculate the entropy of the electorate in each established district
-        H_dist = district_entropies(voter_data)
+        H_dist = district_entropies(voter_data, demographic_var)
         
-        # Calculate the impact of the district on each party
-        I_p = party_impacts(H_indi, H_dist, voter_data)
+        # Calculate the impact of the district on each category
+        I_c = category_impacts(H_indi, H_dist, voter_data, demographic_var)
         
-        # Calculate the average impact of the district on each party
-        party_counts = np.bincount(voter_data.party)
-        avg_I_p = I_p / party_counts
+        # Calculate the average impact of the district on each category
+        category_counts = np.bincount(voter_data.data[demographic_var])
+        avg_I_c = I_c / category_counts
         
-        # Calculate impact gap (currently for two-party system)
-        if voter_data.num_parties == 2:
-            impact_gap = avg_I_p[1] - avg_I_p[0]
-        else:
-            logging.warning("Impact gap calculation optimized for two-party system")
-            impact_gap = None
+        # Get category names
+        category_names = DEMOGRAPHIC_VARIABLES[demographic_var]['name_getter'](voter_data)
+        
+        # Calculate overall impact gap (difference between max and min impacts)
+        impact_gap = np.max(avg_I_c) - np.min(avg_I_c)
+        max_impact_category = category_names[np.argmax(avg_I_c)]
+        min_impact_category = category_names[np.argmin(avg_I_c)]
             
         return {
+            'demographic_var': demographic_var,
             'impact_gap': impact_gap,
-            'party_impacts': I_p,
-            'avg_party_impacts': avg_I_p,
-            'party_counts': party_counts,
+            'category_impacts': I_c,
+            'avg_category_impacts': avg_I_c,
+            'category_counts': category_counts,
             'individual_entropies': H_indi,
-            'district_entropies': H_dist
+            'district_entropies': H_dist,
+            'max_impact_category': max_impact_category,
+            'min_impact_category': min_impact_category,
+            'category_names': category_names
         }
         
     except Exception as e:
         logging.error(f"Error calculating impact gap: {str(e)}")
         raise
-
-def parse_voter_file(file_path: str, header_lines: int = 0) -> VoterData:
-    """
-    Parse voter data from CSV file.
-    
-    Args:
-        file_path: Path to CSV file
-        header_lines: Number of header lines to skip
-    
-    Returns:
-        VoterData instance containing parsed voter information
-    """
-    try:
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Voter file not found: {file_path}")
-            
-        voters = np.genfromtxt(
-            file_path,
-            dtype=[('x1', 'f8'), ('x2', 'f8'), ('party', 'i4'), ('district', 'i4')],
-            delimiter=',',
-            skip_header=header_lines
-        )
-        
-        return VoterData.from_array(voters)
-        
-    except Exception as e:
-        logging.error(f"Error parsing voter file: {str(e)}")
-        raise
-
 
 def main(args: argparse.Namespace) -> None:
     """
@@ -325,28 +304,41 @@ def main(args: argparse.Namespace) -> None:
         output_dir = Path(args.out)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Parse voter data
-        voter_data = parse_voter_file(args.v, args.h)
+        # Load voter data
+        voter_data = VoterData.from_hdf5(args.input)
         
         # Calculate impact gap
-        results = calculate_impact_gap(voter_data)
+        results = calculate_impact_gap(voter_data, args.demographic)
         
         # Log results
-        logging.info("Calculation Results:")
-        logging.info(f"Impact Gap: {results['impact_gap']}")
-        logging.info(f"Party Impacts: {results['party_impacts']}")
-        logging.info(f"Average Party Impacts: {results['avg_party_impacts']}")
+        logging.info(f"\nImpact Gap Analysis for {results['demographic_var']}:")
+        logging.info(f"Overall Impact Gap: {results['impact_gap']:.4f}")
+        logging.info(f"Most Impacted: {results['max_impact_category']}")
+        logging.info(f"Least Impacted: {results['min_impact_category']}")
+        logging.info("\nDetailed Category Impacts:")
         
-        # Save results to output directory
+        for category, (impact, avg_impact) in enumerate(zip(
+            results['category_impacts'],
+            results['avg_category_impacts']
+        )):
+            category_name = results['category_names'][category]
+            count = results['category_counts'][category]
+            logging.info(
+                f"{category_name}: Impact = {impact:.4f}, "
+                f"Avg Impact = {avg_impact:.4f}, "
+                f"Count = {count}"
+            )
+        
+        # Save results
         np.savez(
-            output_dir / 'impact_gap_results.npz',
-            **results
+            output_dir / f'impact_gap_{args.demographic}_results.npz',
+            **results,
+            metadata=voter_data.metadata.to_dict()
         )
         
     except Exception as e:
         logging.error(f"Error in main execution: {str(e)}")
         raise
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -354,16 +346,17 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        '--v',
-        help='Input CSV file with voter data (x, y coords and party/district IDs)',
+        '--input',
+        help='Input HDF5 file containing voter data',
         type=str,
         required=True
     )
     parser.add_argument(
-        '--h',
-        help='Number of header lines in voter CSV file',
-        type=int,
-        default=0
+        '--demographic',
+        help='Demographic variable to analyze',
+        type=str,
+        choices=list(DEMOGRAPHIC_VARIABLES.keys()),
+        default='party_id'
     )
     parser.add_argument(
         '--out',
